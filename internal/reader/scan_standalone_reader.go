@@ -21,18 +21,19 @@ import (
 )
 
 type ScanReaderOptions struct {
-	Cluster         bool             `mapstructure:"cluster" default:"false"`
-	Address         string           `mapstructure:"address" default:""`
-	Username        string           `mapstructure:"username" default:""`
-	Password        string           `mapstructure:"password" default:""`
-	Tls             bool             `mapstructure:"tls" default:"false"`
-	TlsConfig       client.TlsConfig `mapstructure:"tls_config" default:"{}"`
-	Scan            bool             `mapstructure:"scan" default:"true"`
-	KSN             bool             `mapstructure:"ksn" default:"false"`
-	DBS             []int            `mapstructure:"dbs"`
-	PreferReplica   bool             `mapstructure:"prefer_replica" default:"false"`
-	Count           int              `mapstructure:"count" default:"1"`
-	SkipUnknownType []string         `mapstructure:"skip_unknown_type" default:"[]"`
+	KSNDebounceInterval string           `mapstructure:"ksn_debounce_interval" default:"0s"`
+	Cluster             bool             `mapstructure:"cluster" default:"false"`
+	Address             string           `mapstructure:"address" default:""`
+	Username            string           `mapstructure:"username" default:""`
+	Password            string           `mapstructure:"password" default:""`
+	Tls                 bool             `mapstructure:"tls" default:"false"`
+	TlsConfig           client.TlsConfig `mapstructure:"tls_config" default:"{}"`
+	Scan                bool             `mapstructure:"scan" default:"true"`
+	KSN                 bool             `mapstructure:"ksn" default:"false"`
+	DBS                 []int            `mapstructure:"dbs"`
+	PreferReplica       bool             `mapstructure:"prefer_replica" default:"false"`
+	Count               int              `mapstructure:"count" default:"1"`
+	SkipUnknownType     []string         `mapstructure:"skip_unknown_type" default:"[]"`
 }
 
 type dbKey struct {
@@ -85,6 +86,10 @@ func NewScanStandaloneReader(ctx context.Context, opts *ScanReaderOptions) Reade
 
 func (r *scanStandaloneReader) StartRead(ctx context.Context) []chan *entry.Entry {
 	r.ctx = ctx
+	_, err := parseKSNDebounce(r.opts.KSNDebounceInterval)
+	if err != nil {
+		log.Panicf("invalid ksn_debounce_interval: %v", err)
+	}
 	if r.opts.Scan {
 		r.scanWG.Add(1)
 	}
@@ -143,11 +148,17 @@ func (r *scanStandaloneReader) subscribe() {
 		}
 	}()
 
+	interval, _ := parseKSNDebounce(r.opts.KSNDebounceInterval)
+	events := make(chan dbKey, 1024)
+	done := make(chan struct{})
+	go func() { defer close(done); debounceKSN(events, interval, func(k dbKey) { r.needDumpQueue.Put(k) }) }()
 	regex := regexp.MustCompile(`\d+`)
 	for {
 		select {
 		case <-r.ctx.Done():
 			log.Infof("[%s] scanStandaloneReader subscribe finished.", r.stat.Name)
+			close(events)
+			<-done          // flush accepted notifications before closing the dump queue
 			r.scanWG.Wait() // scan keeps putting keys until it sees ctx.Done
 			r.needDumpQueue.Close()
 			return
@@ -170,16 +181,9 @@ func (r *scanStandaloneReader) subscribe() {
 			if err != nil {
 				log.Panicf("%v", err)
 			}
-			// handle del action
-			eventSlice := strings.Split(respSlice[2].(string), ":")
-			if eventSlice[1] == "del" {
-				e := entry.NewEntry()
-				e.DbId = dbIdInt
-				e.Argv = []string{"DEL", key}
-				r.ch <- e
-				continue
-			}
-			r.needDumpQueue.Put(dbKey{db: dbIdInt, key: key})
+			// All notifications, including del/expired/evicted, reconcile current
+			// source state through the same ordered DUMP/RESTORE pipeline.
+			events <- dbKey{db: dbIdInt, key: key}
 		}
 	}
 }
@@ -320,6 +324,7 @@ func (r *scanStandaloneReader) restore() {
 			}
 		}
 		if errors.Is(err1, proto.Nil) {
+			r.ch <- &entry.Entry{DbId: dbId, Argv: []string{"DEL", key}}
 			continue // key not exist
 		} else if err1 != nil {
 			log.Panicf("%v", err1)
@@ -341,6 +346,7 @@ func (r *scanStandaloneReader) restore() {
 		}
 
 		if pttl == -2 {
+			r.ch <- &entry.Entry{DbId: dbId, Argv: []string{"DEL", key}}
 			continue // key not exist
 		}
 		if pttl == -1 {
