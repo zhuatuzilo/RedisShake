@@ -20,7 +20,10 @@ import (
 	"RedisShake/internal/utils"
 )
 
+const defaultScanQueueCapacity = 1_000_000
+
 type ScanReaderOptions struct {
+	QueueCapacity       int              `mapstructure:"queue_capacity" default:"1000000"`
 	KSNDebounceInterval string           `mapstructure:"ksn_debounce_interval" default:"0s"`
 	Cluster             bool             `mapstructure:"cluster" default:"false"`
 	Address             string           `mapstructure:"address" default:""`
@@ -41,8 +44,11 @@ type dbKey struct {
 	key string
 }
 
-// dumpPing in needDumpQueue asks dump() to ping its connection.
-type dumpPing struct{}
+// dumpItem represents a key reconciliation or a dump connection heartbeat.
+type dumpItem struct {
+	dbKey
+	ping bool
+}
 
 type needRestoreItem struct {
 	dbId int
@@ -55,21 +61,25 @@ type scanStandaloneReader struct {
 	dbs             []int
 	opts            *ScanReaderOptions
 	ch              chan *entry.Entry
-	needDumpQueue   *utils.UniqueQueue
+	needDumpQueue   *utils.UniqueQueue[dumpItem]
 	needRestoreChan chan *needRestoreItem
 	dumpClient      *client.Redis
 	subWG           sync.WaitGroup
 	scanWG          sync.WaitGroup
 	isValkey        bool
 
-	stat struct {
-		Name              string `json:"name"`
-		ScanFinished      bool   `json:"scan_finished"`
-		ScanDbId          int    `json:"scan_dbId"`
-		ScanCursor        uint64 `json:"scan_cursor"`
-		ScanPercentByDbId string `json:"scan_percent"`
-		NeedUpdateCount   int64  `json:"need_update_count"`
-	}
+	statMu sync.Mutex
+	stat   scanReaderStatus
+}
+
+type scanReaderStatus struct {
+	Name              string `json:"name"`
+	ScanFinished      bool   `json:"scan_finished"`
+	ScanDbId          int    `json:"scan_dbId"`
+	ScanCursor        uint64 `json:"scan_cursor"`
+	ScanPercentByDbId string `json:"scan_percent"`
+	NeedUpdateCount   int64  `json:"need_update_count"`
+	QueueCapacity     int    `json:"queue_capacity"`
 }
 
 func NewScanStandaloneReader(ctx context.Context, opts *ScanReaderOptions) Reader {
@@ -78,7 +88,14 @@ func NewScanStandaloneReader(ctx context.Context, opts *ScanReaderOptions) Reade
 	r.opts = opts
 	r.ch = make(chan *entry.Entry, 1024)
 	r.stat.Name = "reader_" + strings.Replace(opts.Address, ":", "_", -1)
-	r.needDumpQueue = utils.NewUniqueQueue(100000000)     // cache 100000000 keys
+	capacity := opts.QueueCapacity
+	if capacity < 0 {
+		log.Panicf("scan_reader.queue_capacity must be positive (or zero for the default)")
+	}
+	if capacity == 0 {
+		capacity = defaultScanQueueCapacity
+	}
+	r.needDumpQueue = utils.NewUniqueQueue[dumpItem](capacity)
 	r.needRestoreChan = make(chan *needRestoreItem, 1024) // inflight 1024 keys
 	log.Infof("[%s] scanStandaloneReader init finished. dbs=[%v]", r.stat.Name, r.dbs)
 	return r
@@ -151,7 +168,10 @@ func (r *scanStandaloneReader) subscribe() {
 	interval, _ := parseKSNDebounce(r.opts.KSNDebounceInterval)
 	events := make(chan dbKey, 1024)
 	done := make(chan struct{})
-	go func() { defer close(done); debounceKSN(events, interval, func(k dbKey) { r.needDumpQueue.Put(k) }) }()
+	go func() {
+		defer close(done)
+		debounceKSN(events, interval, r.needDumpQueue.Cap(), func(k dbKey) { r.needDumpQueue.Put(dumpItem{dbKey: k}) })
+	}()
 	regex := regexp.MustCompile(`\d+`)
 	for {
 		select {
@@ -168,11 +188,11 @@ func (r *scanStandaloneReader) subscribe() {
 				if r.ctx.Err() != nil {
 					continue // the connection was closed above on shutdown
 				}
-				log.Panicf("%v", err)
+				log.Panicf("[%s] KSN subscription failed; notifications may have been lost: %v", r.stat.Name, err)
 			}
 			respSlice := resp.([]interface{})
 			if len(respSlice) == 2 { // reply to PING: ["pong", ""]
-				r.needDumpQueue.Put(dumpPing{})
+				r.needDumpQueue.Put(dumpItem{ping: true})
 				continue
 			}
 			key := respSlice[3].(string)
@@ -225,20 +245,23 @@ func (r *scanStandaloneReader) scan() {
 			var keys []string
 			cursor, keys = c.Scan(cursor, count)
 			for _, key := range keys {
-				r.needDumpQueue.Put(dbKey{dbId, key}) // pass value not pointer
+				r.needDumpQueue.Put(dumpItem{dbKey: dbKey{dbId, key}})
 			}
 
-			// stat
+			r.statMu.Lock()
 			r.stat.ScanCursor = cursor
 			r.stat.ScanDbId = dbId
 			r.stat.ScanPercentByDbId = fmt.Sprintf("%.2f%%", float64(bits.Reverse64(cursor))/float64(^uint(0))*100)
+			r.statMu.Unlock()
 
 			if cursor == 0 {
 				break
 			}
 		}
 	}
+	r.statMu.Lock()
 	r.stat.ScanFinished = true
+	r.statMu.Unlock()
 	if !r.opts.KSN {
 		r.needDumpQueue.Close()
 	}
@@ -255,15 +278,14 @@ func (r *scanStandaloneReader) dump() {
 		log.Infof("running dump() in read-only mode")
 	}
 
-	for item := range r.needDumpQueue.Ch {
-		if _, ok := item.(dumpPing); ok {
+	for item, ok := r.needDumpQueue.Get(); ok; item, ok = r.needDumpQueue.Get() {
+		if item.ping {
 			r.dumpClient.Send("PING")
 			r.needRestoreChan <- &needRestoreItem{ping: true}
 			continue
 		}
-		r.stat.NeedUpdateCount = int64(r.needDumpQueue.Len())
-		dbId := item.(dbKey).db
-		key := item.(dbKey).key
+		dbId := item.db
+		key := item.key
 		if nowDbId != dbId {
 			r.dumpClient.Send("SELECT", strconv.Itoa(dbId))
 			nowDbId = dbId
@@ -386,17 +408,29 @@ func (r *scanStandaloneReader) restore() {
 	close(r.ch)
 }
 
+func (r *scanStandaloneReader) statusSnapshot() scanReaderStatus {
+	r.statMu.Lock()
+	defer r.statMu.Unlock()
+	stat := r.stat
+	stat.NeedUpdateCount = int64(r.needDumpQueue.Len())
+	stat.QueueCapacity = r.needDumpQueue.Cap()
+	return stat
+}
+
 func (r *scanStandaloneReader) Status() interface{} {
-	return r.stat
+	return r.statusSnapshot()
 }
 
 func (r *scanStandaloneReader) StatusString() string {
-	if r.stat.ScanFinished {
-		return fmt.Sprintf("need_update_count=[%d]", r.stat.NeedUpdateCount)
+	stat := r.statusSnapshot()
+	backlog := fmt.Sprintf("need_update_count=[%d], queue_capacity=[%d]", stat.NeedUpdateCount, stat.QueueCapacity)
+	if stat.ScanFinished {
+		return backlog
 	}
-	return fmt.Sprintf("scan_dbid=[%d], scan_percent=[%s], need_update_count=[%d]", r.stat.ScanDbId, r.stat.ScanPercentByDbId, r.stat.NeedUpdateCount)
+	return fmt.Sprintf("scan_dbid=[%d], scan_percent=[%s], %s", stat.ScanDbId, stat.ScanPercentByDbId, backlog)
 }
 
 func (r *scanStandaloneReader) StatusConsistent() bool {
-	return r.stat.ScanFinished && r.stat.NeedUpdateCount == 0
+	stat := r.statusSnapshot()
+	return stat.ScanFinished && stat.NeedUpdateCount == 0
 }

@@ -22,7 +22,7 @@ func parseKSNDebounce(value string) (time.Duration, error) {
 // debounceKSN owns all pending state in one goroutine. A fixed window from
 // the first notification bounds latency even for continuously updated keys.
 // Closing input flushes every accepted key synchronously before returning.
-func debounceKSN(input <-chan dbKey, interval time.Duration, emit func(dbKey)) {
+func debounceKSN(input <-chan dbKey, interval time.Duration, capacity int, emit func(dbKey)) {
 	if interval == 0 {
 		for k := range input {
 			emit(k)
@@ -42,6 +42,14 @@ func debounceKSN(input <-chan dbKey, interval time.Duration, emit func(dbKey)) {
 				return
 			}
 			if _, exists := pending[k]; !exists {
+				// Under pressure, flush the current window and preserve every
+				// accepted key. Emitting blocks when the dump queue is full.
+				if len(pending) == capacity {
+					for key := range pending {
+						emit(key)
+					}
+					clear(pending)
+				}
 				pending[k] = time.Now().Add(interval)
 			}
 		case now := <-ticker.C:
