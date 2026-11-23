@@ -1,6 +1,7 @@
 package reader
 
 import (
+	"RedisShake/internal/utils"
 	"reflect"
 	"testing"
 	"time"
@@ -27,7 +28,7 @@ func TestKSNDebounceFlushAndDBIsolation(t *testing.T) {
 	input <- b
 	close(input)
 	got := map[dbKey]int{}
-	debounceKSN(input, time.Hour, func(k dbKey) { got[k]++ })
+	debounceKSN(input, time.Hour, 1024, func(k dbKey) { got[k]++ })
 	if !reflect.DeepEqual(got, map[dbKey]int{a: 1, b: 1}) {
 		t.Fatal(got)
 	}
@@ -41,7 +42,7 @@ func TestKSNDebounceDisabledPreservesEvents(t *testing.T) {
 	}
 	close(input)
 	var got []dbKey
-	debounceKSN(input, 0, func(k dbKey) { got = append(got, k) })
+	debounceKSN(input, 0, 1024, func(k dbKey) { got = append(got, k) })
 	if !reflect.DeepEqual(got, want) {
 		t.Fatal(got)
 	}
@@ -51,7 +52,7 @@ func TestKSNDebounceEmitsWhileKeyRemainsHot(t *testing.T) {
 	input := make(chan dbKey)
 	output := make(chan dbKey, 100)
 	done := make(chan struct{})
-	go func() { debounceKSN(input, 10*time.Millisecond, func(k dbKey) { output <- k }); close(done) }()
+	go func() { debounceKSN(input, 10*time.Millisecond, 1024, func(k dbKey) { output <- k }); close(done) }()
 	stop := make(chan struct{})
 	producerDone := make(chan struct{})
 	go func() {
@@ -72,5 +73,36 @@ func TestKSNDebounceEmitsWhileKeyRemainsHot(t *testing.T) {
 	close(stop)
 	<-producerDone
 	close(input)
+	<-done
+}
+
+func TestKSNDebounceBackpressureDrains(t *testing.T) {
+	queue := utils.NewUniqueQueue[dumpItem](1)
+	queue.Put(dumpItem{ping: true})
+	input := make(chan dbKey, 3)
+	keys := []dbKey{{db: 0, key: "same"}, {db: 1, key: "same"}, {db: 0, key: "last"}}
+	for _, key := range keys {
+		input <- key
+	}
+	close(input)
+	done := make(chan struct{})
+	go func() {
+		debounceKSN(input, time.Hour, 1, func(k dbKey) { queue.Put(dumpItem{dbKey: k}) })
+		queue.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("debounce completed despite full output queue")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if item, ok := queue.Get(); !ok || !item.ping {
+		t.Fatal("missing heartbeat")
+	}
+	for _, key := range keys {
+		if item, ok := queue.Get(); !ok || item.dbKey != key {
+			t.Fatalf("got %+v, %v; want %+v", item, ok, key)
+		}
+	}
 	<-done
 }

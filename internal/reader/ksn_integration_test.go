@@ -77,7 +77,7 @@ func testKSNRealRedis(t *testing.T, scan bool) {
 	defer func() { config.Opt.Advanced = old }()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	r := &scanStandaloneReader{opts: &ScanReaderOptions{KSN: true, Scan: scan, Count: 1, KSNDebounceInterval: "100ms"}, ch: make(chan *entry.Entry, 1024), needDumpQueue: utils.NewUniqueQueue(1024), needRestoreChan: make(chan *needRestoreItem, 1024)}
+	r := &scanStandaloneReader{opts: &ScanReaderOptions{KSN: true, Scan: scan, Count: 1, KSNDebounceInterval: "100ms"}, ch: make(chan *entry.Entry, 1024), needDumpQueue: utils.NewUniqueQueue[dumpItem](2), needRestoreChan: make(chan *needRestoreItem, 1024)}
 	r.opts.Address = sourceAddr
 	var restores atomic.Int64
 	done := make(chan struct{})
